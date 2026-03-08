@@ -52,8 +52,14 @@ SUSPICIOUS = [
 
 async def init_db():
     global db
-    db = await asyncpg.create_pool(DB_URL)
 
+    db = await asyncpg.create_pool(
+        DB_URL,
+        min_size=1,
+        max_size=5,
+        command_timeout=60,
+        statement_cache_size=0
+    )
 
 async def is_whitelisted(chat_id,user_id):
 
