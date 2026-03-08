@@ -1,24 +1,35 @@
 import asyncio
 import hashlib
+import os
+import asyncpg
+
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.filters import Command
+
 from groq import Groq
 
-BOT_TOKEN = "BOT_TOKEN"
-GROQ_KEY = "GROQ_API_KEY"
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+GROQ_KEY = os.getenv("GROQ_API_KEY")
+DB_URL = os.getenv("DATABASE_URL")
+
 
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
-client = Groq(api_key=GROQ_KEY)
+groq_client = Groq(api_key=GROQ_KEY)
 
-# --------- DATA ---------
+db = None
 
-whitelist = {}
-antispam_enabled = {}
-cache = {}
+
+# -------- LOCAL CACHE --------
+
+message_cache = {}
 user_activity = {}
+
+
+# -------- SUSPICIOUS WORDS --------
 
 SUSPICIOUS = [
     "http",
@@ -32,25 +43,85 @@ SUSPICIOUS = [
     "пишите",
     "канал",
     "crypto",
-    "bet"
+    "bet",
+    "ref"
 ]
 
-# --------- HELPERS ---------
 
-def is_suspicious(text: str):
+# -------- DATABASE --------
+
+async def init_db():
+    global db
+    db = await asyncpg.create_pool(DB_URL)
+
+
+async def is_whitelisted(chat_id,user_id):
+
+    row = await db.fetchrow(
+        "select 1 from whitelist where chat_id=$1 and user_id=$2",
+        chat_id,
+        user_id
+    )
+
+    return bool(row)
+
+
+async def add_whitelist(chat_id,user_id):
+
+    await db.execute(
+        "insert into whitelist(chat_id,user_id) values($1,$2) on conflict do nothing",
+        chat_id,
+        user_id
+    )
+
+
+async def antispam_enabled(chat_id):
+
+    row = await db.fetchrow(
+        "select enabled from chats where chat_id=$1",
+        chat_id
+    )
+
+    if not row:
+        await db.execute(
+            "insert into chats(chat_id,enabled) values($1,true)",
+            chat_id
+        )
+        return True
+
+    return row["enabled"]
+
+
+async def toggle_antispam(chat_id):
+
+    await db.execute(
+        "update chats set enabled = not enabled where chat_id=$1",
+        chat_id
+    )
+
+
+# -------- HELPERS --------
+
+def suspicious(text):
+
     text = text.lower()
+
     return any(word in text for word in SUSPICIOUS)
 
-def message_hash(text: str):
+
+def msg_hash(text):
+
     return hashlib.md5(text.encode()).hexdigest()
 
-def check_flood(chat_id, user_id):
+
+def check_flood(chat_id,user_id):
 
     key = f"{chat_id}:{user_id}"
 
     now = asyncio.get_event_loop().time()
 
-    timestamps = user_activity.get(key, [])
+    timestamps = user_activity.get(key,[])
+
     timestamps = [t for t in timestamps if now - t < 5]
 
     timestamps.append(now)
@@ -58,6 +129,7 @@ def check_flood(chat_id, user_id):
     user_activity[key] = timestamps
 
     return len(timestamps) >= 3
+
 
 async def ai_check(text):
 
@@ -69,101 +141,90 @@ async def ai_check(text):
 
 Это реклама или спам?
 
-Ответь только одним словом:
+Ответь только:
 
 SPAM
 или
 OK
 """
 
-    response = client.chat.completions.create(
+    response = groq_client.chat.completions.create(
         model="llama3-8b-8192",
-        messages=[{"role":"user","content":prompt}],
+        messages=[{"role":"user","content":prompt}]
     )
 
     return response.choices[0].message.content.strip()
 
-# --------- PANEL ---------
 
-def panel_keyboard(chat_id):
+# -------- PANEL --------
 
-    enabled = antispam_enabled.get(chat_id, True)
-
-    status = "🟢 ON" if enabled else "🔴 OFF"
+def panel():
 
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text=f"Antispam {status}", callback_data="toggle")],
+            [InlineKeyboardButton(text="Toggle Antispam",callback_data="toggle")]
         ]
     )
 
-@dp.message(Command("panel"))
-async def panel(message: Message):
 
-    chat_id = message.chat.id
+@dp.message(Command("panel"))
+async def panel_cmd(message: Message):
 
     if message.chat.type == "private":
         return
 
-    if not message.from_user:
-        return
-
-    member = await bot.get_chat_member(chat_id, message.from_user.id)
+    member = await bot.get_chat_member(message.chat.id,message.from_user.id)
 
     if member.status not in ["administrator","creator"]:
         return
 
-    await message.reply("Antispam panel", reply_markup=panel_keyboard(chat_id))
+    await message.reply("Antispam control",reply_markup=panel())
 
-@dp.callback_query(F.data == "toggle")
-async def toggle_antispam(call: CallbackQuery):
 
-    chat_id = call.message.chat.id
+@dp.callback_query(F.data=="toggle")
+async def toggle(call: CallbackQuery):
 
-    current = antispam_enabled.get(chat_id, True)
+    await toggle_antispam(call.message.chat.id)
 
-    antispam_enabled[chat_id] = not current
+    await call.answer()
 
-    await call.message.edit_reply_markup(reply_markup=panel_keyboard(chat_id))
 
-# --------- WHITELIST ---------
+# -------- WHITELIST --------
 
 @dp.message(Command("whitelist"))
-async def whitelist_add(message: Message):
+async def whitelist(message: Message):
 
     if not message.reply_to_message:
         return
 
-    chat_id = message.chat.id
-
-    member = await bot.get_chat_member(chat_id, message.from_user.id)
+    member = await bot.get_chat_member(message.chat.id,message.from_user.id)
 
     if member.status not in ["administrator","creator"]:
         return
 
     user_id = message.reply_to_message.from_user.id
 
-    whitelist.setdefault(chat_id,set()).add(user_id)
+    await add_whitelist(message.chat.id,user_id)
 
-# --------- FILTER ---------
+
+# -------- FILTER --------
 
 @dp.message()
-async def filter_message(message: Message):
-
-    chat_id = message.chat.id
+async def filter_msg(message: Message):
 
     if message.chat.type == "private":
-        return
-
-    if not antispam_enabled.get(chat_id, True):
         return
 
     if not message.from_user:
         return
 
+    chat_id = message.chat.id
     user_id = message.from_user.id
 
-    if user_id in whitelist.get(chat_id,set()):
+    if not await antispam_enabled(chat_id):
+        return
+
+    if await is_whitelisted(chat_id,user_id):
         return
 
     text = message.text or message.caption or ""
@@ -171,22 +232,24 @@ async def filter_message(message: Message):
     if not text:
         return
 
-    suspicious = is_suspicious(text)
-
+    suspect = suspicious(text)
     flood = check_flood(chat_id,user_id)
-
     bot_sender = message.from_user.is_bot
 
-    if not suspicious and not flood and not bot_sender:
+    if not suspect and not flood and not bot_sender:
         return
 
-    h = message_hash(text)
+    h = msg_hash(text)
 
-    if h in cache:
-        result = cache[h]
+    if h in message_cache:
+
+        result = message_cache[h]
+
     else:
+
         result = await ai_check(text)
-        cache[h] = result
+
+        message_cache[h] = result
 
     if result == "SPAM":
 
@@ -195,10 +258,16 @@ async def filter_message(message: Message):
         except:
             pass
 
-# --------- MAIN ---------
+
+# -------- START --------
 
 async def main():
+
+    await init_db()
+
     await dp.start_polling(bot)
 
+
 if __name__ == "__main__":
+
     asyncio.run(main())
